@@ -4,10 +4,11 @@ import (
 	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"reflect"
 	"strconv"
 	"time"
+
+	"github.com/golang/glog"
 )
 
 const (
@@ -39,6 +40,90 @@ func MustFormatQ(src string, params ...interface{}) Q {
 	return q
 }
 
+func appendString(dst []byte, src string) []byte {
+	dst = append(dst, '\'')
+	for _, c := range []byte(src) {
+		switch c {
+		case '\'':
+			dst = append(dst, "''"...)
+		case '\000':
+			continue
+		default:
+			dst = append(dst, c)
+		}
+	}
+	dst = append(dst, '\'')
+	return dst
+}
+
+func appendRawString(dst []byte, src string) []byte {
+	for _, c := range []byte(src) {
+		if c != '\000' {
+			dst = append(dst, c)
+		}
+	}
+	return dst
+}
+
+func appendBytes(dst []byte, src []byte) []byte {
+	tmp := make([]byte, hex.EncodedLen(len(src)))
+	hex.Encode(tmp, src)
+
+	dst = append(dst, "'\\x"...)
+	dst = append(dst, tmp...)
+	dst = append(dst, '\'')
+	return dst
+}
+
+func appendSubstring(dst []byte, src string) []byte {
+	dst = append(dst, '"')
+	for _, c := range []byte(src) {
+		switch c {
+		case '\'':
+			dst = append(dst, "''"...)
+		case '\000':
+			continue
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '"':
+			dst = append(dst, '\\', '"')
+		default:
+			dst = append(dst, c)
+		}
+	}
+	dst = append(dst, '"')
+	return dst
+}
+
+func appendRawSubstring(dst []byte, src string) []byte {
+	dst = append(dst, '"')
+	for _, c := range []byte(src) {
+		switch c {
+		case '\000':
+			continue
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '"':
+			dst = append(dst, '\\', '"')
+		default:
+			dst = append(dst, c)
+		}
+	}
+	dst = append(dst, '"')
+	return dst
+}
+
+func appendTime(dst []byte, tm time.Time) []byte {
+	dst = append(dst, '\'')
+	dst = append(dst, tm.Local().Format(timestamptzFormat)...)
+	dst = append(dst, '\'')
+	return dst
+}
+
+func appendRawTime(dst []byte, tm time.Time) []byte {
+	return append(dst, tm.Local().Format(timestamptzFormat)...)
+}
+
 func appendIface(dst []byte, srci interface{}) []byte {
 	if srci == nil {
 		return append(dst, "NULL"...)
@@ -46,7 +131,10 @@ func appendIface(dst []byte, srci interface{}) []byte {
 
 	switch src := srci.(type) {
 	case bool:
-		return appendBool(dst, src)
+		if src {
+			return append(dst, "TRUE"...)
+		}
+		return append(dst, "FALSE"...)
 	case int8:
 		return strconv.AppendInt(dst, int64(src), 10)
 	case int16:
@@ -68,45 +156,77 @@ func appendIface(dst []byte, srci interface{}) []byte {
 	case uint:
 		return strconv.AppendUint(dst, uint64(src), 10)
 	case float32:
-		return appendFloat(dst, float64(src))
+		return strconv.AppendFloat(dst, float64(src), 'f', -1, 32)
 	case float64:
-		return appendFloat(dst, src)
+		return strconv.AppendFloat(dst, src, 'f', -1, 64)
 	case string:
 		return appendString(dst, src)
 	case time.Time:
-		dst = append(dst, '\'')
-		dst = appendTime(dst, src)
-		dst = append(dst, '\'')
-		return dst
+		return appendTime(dst, src)
 	case []byte:
-		dst = append(dst, '\'')
-		dst = appendBytes(dst, src)
-		dst = append(dst, '\'')
-		return dst
+		return appendBytes(dst, src)
 	case []string:
-		dst = append(dst, '\'')
-		dst = appendStringSlice(dst, src, false)
+		if len(src) == 0 {
+			return append(dst, "'{}'"...)
+		}
+
+		dst = append(dst, "'{"...)
+		for _, s := range src {
+			dst = appendSubstring(dst, s)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '}'
 		dst = append(dst, '\'')
 		return dst
 	case []int:
-		dst = append(dst, '\'')
-		dst = appendIntSlice(dst, src)
+		if len(src) == 0 {
+			return append(dst, "'{}'"...)
+		}
+
+		dst = append(dst, "'{"...)
+		for _, n := range src {
+			dst = strconv.AppendInt(dst, int64(n), 10)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '}'
 		dst = append(dst, '\'')
 		return dst
 	case []int64:
-		dst = append(dst, '\'')
-		dst = appendInt64Slice(dst, src)
+		if len(src) == 0 {
+			return append(dst, "'{}'"...)
+		}
+
+		dst = append(dst, "'{"...)
+		for _, n := range src {
+			dst = strconv.AppendInt(dst, n, 10)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '}'
 		dst = append(dst, '\'')
 		return dst
 	case map[string]string:
+		if len(src) == 0 {
+			return append(dst, "''"...)
+		}
+
 		dst = append(dst, '\'')
-		dst = appendStringStringMap(dst, src, false)
-		dst = append(dst, '\'')
+		for key, value := range src {
+			dst = appendSubstring(dst, key)
+			dst = append(dst, '=', '>')
+			dst = appendSubstring(dst, value)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '\''
 		return dst
 	case Appender:
 		return src.Append(dst)
 	case driver.Valuer:
-		return appendDriverValue(dst, src)
+		v, err := src.Value()
+		if err != nil {
+			glog.Errorf("%#v value failed: %s", src, err)
+			return append(dst, "NULL"...)
+		}
+		return appendIface(dst, v)
 	default:
 		return appendValue(dst, reflect.ValueOf(srci))
 	}
@@ -124,29 +244,29 @@ func appendValue(dst []byte, v reflect.Value) []byte {
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint:
 		return strconv.AppendUint(dst, v.Uint(), 10)
 	case reflect.Float32, reflect.Float64:
-		return appendFloat(dst, v.Float())
+		return strconv.AppendFloat(dst, v.Float(), 'f', -1, 64)
 	case reflect.String:
 		return appendString(dst, v.String())
 	case reflect.Struct:
 		if v.Type() == timeType {
-			dst = append(dst, '\'')
-			dst = appendTime(dst, v.Interface().(time.Time))
-			dst = append(dst, '\'')
-			return dst
+			return appendTime(dst, v.Interface().(time.Time))
 		}
 	}
 	panic(fmt.Sprintf("pg: unsupported src type: %s", v))
 }
 
 // Returns nil when src is NULL.
-func appendIfaceRaw(dst []byte, srci interface{}) []byte {
+func appendRawIface(dst []byte, srci interface{}) []byte {
 	if srci == nil {
 		return nil
 	}
 
 	switch src := srci.(type) {
 	case bool:
-		return appendBool(dst, src)
+		if src {
+			return append(dst, "TRUE"...)
+		}
+		return append(dst, "FALSE"...)
 	case int8:
 		return strconv.AppendInt(dst, int64(src), 10)
 	case int16:
@@ -168,201 +288,104 @@ func appendIfaceRaw(dst []byte, srci interface{}) []byte {
 	case uint:
 		return strconv.AppendInt(dst, int64(src), 10)
 	case float32:
-		return appendFloat(dst, float64(src))
+		return strconv.AppendFloat(dst, float64(src), 'f', -1, 32)
 	case float64:
-		return appendFloat(dst, src)
+		return strconv.AppendFloat(dst, src, 'f', -1, 64)
 	case string:
-		return appendStringRaw(dst, src)
+		return appendRawString(dst, src)
 	case time.Time:
-		return appendTime(dst, src)
+		return appendRawTime(dst, src)
 	case []byte:
-		return appendBytes(dst, src)
+		tmp := make([]byte, hex.EncodedLen(len(src)))
+		hex.Encode(tmp, src)
+
+		dst = append(dst, "\\x"...)
+		dst = append(dst, tmp...)
+		return dst
 	case []string:
-		return appendStringSlice(dst, src, true)
+		if len(src) == 0 {
+			return append(dst, "{}"...)
+		}
+
+		dst = append(dst, "{"...)
+		for _, s := range src {
+			dst = appendRawSubstring(dst, s)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '}'
+		return dst
 	case []int:
-		return appendIntSlice(dst, src)
+		if len(src) == 0 {
+			return append(dst, "{}"...)
+		}
+
+		dst = append(dst, "{"...)
+		for _, n := range src {
+			dst = strconv.AppendInt(dst, int64(n), 10)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '}'
+		return dst
 	case []int64:
-		return appendInt64Slice(dst, src)
+		if len(src) == 0 {
+			return append(dst, "{}"...)
+		}
+
+		dst = append(dst, "{"...)
+		for _, n := range src {
+			dst = strconv.AppendInt(dst, n, 10)
+			dst = append(dst, ',')
+		}
+		dst[len(dst)-1] = '}'
+		return dst
 	case map[string]string:
-		return appendStringStringMap(dst, src, true)
+		if len(src) == 0 {
+			return dst
+		}
+
+		for key, value := range src {
+			dst = appendRawSubstring(dst, key)
+			dst = append(dst, '=', '>')
+			dst = appendRawSubstring(dst, value)
+			dst = append(dst, ',')
+		}
+		dst = dst[:len(dst)-1]
+		return dst
 	case RawAppender:
 		return src.AppendRaw(dst)
 	case driver.Valuer:
-		return appendDriverValueRaw(dst, src)
+		v, err := src.Value()
+		if err != nil {
+			glog.Errorf("%#v value failed: %s", src, err)
+			return nil
+		}
+		return appendRawIface(dst, v)
 	default:
-		return appendValueRaw(dst, reflect.ValueOf(srci))
+		return appendRawValue(dst, reflect.ValueOf(srci))
 	}
 }
 
-func appendValueRaw(dst []byte, v reflect.Value) []byte {
+func appendRawValue(dst []byte, v reflect.Value) []byte {
 	switch v.Kind() {
 	case reflect.Ptr:
 		if v.IsNil() {
 			return nil
 		}
-		return appendValueRaw(dst, v.Elem())
+		return appendRawValue(dst, v.Elem())
 	case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int:
 		return strconv.AppendInt(dst, v.Int(), 10)
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint:
 		return strconv.AppendUint(dst, v.Uint(), 10)
 	case reflect.Float32, reflect.Float64:
-		return appendFloat(dst, v.Float())
+		return strconv.AppendFloat(dst, v.Float(), 'f', -1, 64)
 	case reflect.String:
-		return appendStringRaw(dst, v.String())
+		return appendRawString(dst, v.String())
 	case reflect.Struct:
 		if v.Type() == timeType {
-			return appendTime(dst, v.Interface().(time.Time))
+			return appendRawTime(dst, v.Interface().(time.Time))
 		}
 	}
 	panic(fmt.Sprintf("pg: unsupported src type: %s", v))
-}
-
-func appendBool(dst []byte, v bool) []byte {
-	if v {
-		return append(dst, "TRUE"...)
-	}
-	return append(dst, "FALSE"...)
-}
-
-func appendFloat(dst []byte, v float64) []byte {
-	return strconv.AppendFloat(dst, v, 'f', -1, 64)
-}
-
-func appendString(dst []byte, src string) []byte {
-	dst = append(dst, '\'')
-	for _, c := range []byte(src) {
-		switch c {
-		case '\'':
-			dst = append(dst, "''"...)
-		case '\000':
-			continue
-		default:
-			dst = append(dst, c)
-		}
-	}
-	dst = append(dst, '\'')
-	return dst
-}
-
-func appendStringRaw(dst []byte, src string) []byte {
-	for _, c := range []byte(src) {
-		if c != '\000' {
-			dst = append(dst, c)
-		}
-	}
-	return dst
-}
-
-func appendSubstring(dst []byte, src string, raw bool) []byte {
-	dst = append(dst, '"')
-	for _, c := range []byte(src) {
-		switch c {
-		case '\'':
-			if raw {
-				dst = append(dst, '\'')
-			} else {
-				dst = append(dst, '\'', '\'')
-			}
-		case '\000':
-			continue
-		case '\\':
-			dst = append(dst, '\\', '\\')
-		case '"':
-			dst = append(dst, '\\', '"')
-		default:
-			dst = append(dst, c)
-		}
-	}
-	dst = append(dst, '"')
-	return dst
-}
-
-func appendBytes(dst []byte, v []byte) []byte {
-	tmp := make([]byte, hex.EncodedLen(len(v)))
-	hex.Encode(tmp, v)
-
-	dst = append(dst, "\\x"...)
-	dst = append(dst, tmp...)
-	return dst
-}
-
-func appendStringStringMap(dst []byte, v map[string]string, raw bool) []byte {
-	if len(v) == 0 {
-		return dst
-	}
-
-	for key, value := range v {
-		dst = appendSubstring(dst, key, raw)
-		dst = append(dst, '=', '>')
-		dst = appendSubstring(dst, value, raw)
-		dst = append(dst, ',')
-	}
-	dst = dst[:len(dst)-1] // Strip trailing comma.
-	return dst
-}
-
-func appendStringSlice(dst []byte, v []string, raw bool) []byte {
-	if len(v) == 0 {
-		return append(dst, "{}"...)
-	}
-
-	dst = append(dst, '{')
-	for _, s := range v {
-		dst = appendSubstring(dst, s, raw)
-		dst = append(dst, ',')
-	}
-	dst[len(dst)-1] = '}' // Replace trailing comma.
-	return dst
-}
-
-func appendIntSlice(dst []byte, v []int) []byte {
-	if len(v) == 0 {
-		return append(dst, "{}"...)
-	}
-
-	dst = append(dst, '{')
-	for _, n := range v {
-		dst = strconv.AppendInt(dst, int64(n), 10)
-		dst = append(dst, ',')
-	}
-	dst[len(dst)-1] = '}' // Replace trailing comma.
-	return dst
-}
-
-func appendInt64Slice(dst []byte, v []int64) []byte {
-	if len(v) == 0 {
-		return append(dst, "{}"...)
-	}
-
-	dst = append(dst, "{"...)
-	for _, n := range v {
-		dst = strconv.AppendInt(dst, n, 10)
-		dst = append(dst, ',')
-	}
-	dst[len(dst)-1] = '}' // Replace trailing comma.
-	return dst
-}
-
-func appendTime(dst []byte, tm time.Time) []byte {
-	return append(dst, tm.Local().Format(timestamptzFormat)...)
-}
-
-func appendDriverValue(dst []byte, v driver.Valuer) []byte {
-	value, err := v.Value()
-	if err != nil {
-		log.Printf("%#v value failed: %s", v, err)
-		return append(dst, "NULL"...)
-	}
-	return appendIface(dst, value)
-}
-
-func appendDriverValueRaw(dst []byte, v driver.Valuer) []byte {
-	value, err := v.Value()
-	if err != nil {
-		log.Printf("%#v value failed: %s", v, err)
-		return nil
-	}
-	return appendIfaceRaw(dst, value)
 }
 
 //------------------------------------------------------------------------------
@@ -373,8 +396,8 @@ func formatQuery(dst, src []byte, params []interface{}) ([]byte, error) {
 	}
 
 	var structptr, structv reflect.Value
-	var fields map[string]valuer
-	var methods map[string]valuer
+	var fields map[string][]int
+	var methods map[string]int
 	var paramInd int
 
 	p := &parser{b: src}
@@ -391,6 +414,8 @@ func formatQuery(dst, src []byte, params []interface{}) ([]byte, error) {
 			dst = append(dst, ch)
 			continue
 		}
+
+		var value interface{}
 
 		name := p.ReadName()
 		if name != "" {
@@ -413,12 +438,10 @@ func formatQuery(dst, src []byte, params []interface{}) ([]byte, error) {
 				methods = structs.Methods(structptr.Type())
 			}
 
-			if field, ok := fields[name]; ok {
-				dst = field.AppendValue(dst, structv)
-				continue
-			} else if field, ok := methods[name]; ok {
-				dst = field.AppendValue(dst, structptr)
-				continue
+			if indx, ok := fields[name]; ok {
+				value = structv.FieldByIndex(indx).Interface()
+			} else if indx, ok := methods[name]; ok {
+				value = structptr.Method(indx).Call(nil)[0].Interface()
 			} else {
 				return nil, errorf("pg: cannot map %q", name)
 			}
@@ -430,9 +453,11 @@ func formatQuery(dst, src []byte, params []interface{}) ([]byte, error) {
 				)
 			}
 
-			dst = appendIface(dst, params[paramInd])
+			value = params[paramInd]
 			paramInd++
 		}
+
+		dst = appendIface(dst, value)
 	}
 
 	if paramInd < len(params) {

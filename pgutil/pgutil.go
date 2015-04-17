@@ -22,7 +22,7 @@ func Underscore(s string) string {
 		c := b[i]
 		if isUpper(c) {
 			if i-1 > 0 && i+1 < len(b) && (isLower(b[i-1]) || isLower(b[i+1])) {
-				r = append(r, '_', toLower(c))
+				r = append(r /*'_',*/, toLower(c))
 			} else {
 				r = append(r, toLower(c))
 			}

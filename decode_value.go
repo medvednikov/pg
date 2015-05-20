@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"gopkg.in/pg.v3/pgutil"
+	"github.com/medvednikov/pg/pgutil"
 )
 
 var (

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"gopkg.in/pg.v3/pgutil"
+	"github.com/medvednikov/pg/pgutil"
 )
 
 func AppendQ(dst []byte, src string, params ...interface{}) ([]byte, error) {

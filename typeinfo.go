@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"sync"
 
-	"gopkg.in/pg.v3/pgutil"
+	"github.com/medvednikov/pg/pgutil"
 )
 
 const (
